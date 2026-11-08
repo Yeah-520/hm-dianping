@@ -2,6 +2,7 @@ package com.hmdp.utils;
 
 import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
+import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -58,7 +59,7 @@ public class CacheClient {
             return JSONUtil.toBean(Json, type);
         }
 
-        if (Json != null) {
+        if (Json == null) {
             return null;
         }
 
@@ -87,26 +88,36 @@ public class CacheClient {
      * @param <ID>       缓存key的类型
      * @return 缓存中的数据或通过dbFallback获取的数据
      */
-    public <R, ID> R queryWithLogicalExpire(String keyPrefix, ID id, Class<R> type, Function<ID, R> dbFallback, Long time, TimeUnit unit) {
+    public <R, ID> R handleCacheBreakdownByLogicalExpire(String keyPrefix, String lockKeyPrefix,
+                                                         ID id, Class<R> type, Function<ID, R> dbFallback, Long time, TimeUnit unit) {
         String key = keyPrefix + id;
 
-        String Json = stringRedisTemplate.opsForValue().get(key);
-
-        if (StrUtil.isBlank(Json)) {
+        String json = stringRedisTemplate.opsForValue().get(key);
+        // 判断缓存是否命中（由于是热点数据，提前进行缓存预热，默认缓存一定会命中）
+        if (StrUtil.isBlank(json)) {
             return null;
         }
 
-        RedisData redisData = JSONUtil.toBean(Json, RedisData.class);
-        R r = JSONUtil.toBean((JSONUtil.toJsonStr(redisData.getData())), type);
-        LocalDateTime expireTime = redisData.getExpireTime();
+        RedisData redisData = JSONUtil.toBean(json, RedisData.class);
+        R r = JSONUtil.toBean(JSONUtil.toJsonStr(redisData.getData()), type);
 
-        if (expireTime.isAfter(LocalDateTime.now())) {
+        if (redisData.getExpireTime().isAfter(LocalDateTime.now())) {
             return r;
         }
 
-        String lockKey = LOCK_SHOP_KEY + key;
-        boolean isLocked = tryLock(lockKey);
-        if (isLocked) {
+        String lockKey = lockKeyPrefix + id;
+        if (tryLock(lockKey)) {
+            // 在线程1重建缓存期间，线程2进行过期判断，假设此时key是过期状态，线程1重建完成并释放锁，线程2立刻获取锁，并启动异步线程执行重建，那此时的重建就与线程1的重建重复了
+            // 因此需要在线程2获取锁成功后，在这里再次检测redis中缓存是否过期（DoubleCheck），如果未过期则无需重建缓存，防止数据过期之后，刚释放锁就有线程拿到锁的情况，重复访问数据库进行重建
+            json = stringRedisTemplate.opsForValue().get(key);
+            // 缓存命中，先把json反序列化为逻辑过期对象
+            redisData = JSONUtil.toBean(json, RedisData.class);
+
+            r = JSONUtil.toBean(JSONUtil.toJsonStr(redisData.getData()), type);
+            // 判断是否逻辑过期
+            if (redisData.getExpireTime().isAfter(LocalDateTime.now())) {
+                return r;
+            }
             CACHE_REBUILD_EXECUTOR.submit(() -> {
                 try {
                     R r1 = dbFallback.apply(id);
