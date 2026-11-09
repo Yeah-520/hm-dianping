@@ -1,14 +1,25 @@
 package com.hmdp.service.impl;
 
+import com.hmdp.dto.Result;
+import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.entity.VoucherOrder;
 import com.hmdp.mapper.VoucherOrderMapper;
+import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.hmdp.utils.RedisIdWorker;
+import com.hmdp.utils.UserHolder;
+import org.springframework.aop.framework.AopContext;
+import org.springframework.lang.NonNull;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import javax.annotation.Resource;
+import java.time.LocalDateTime;
 
 /**
  * <p>
- *  服务实现类
+ * 服务实现类
  * </p>
  *
  * @author 虎哥
@@ -17,4 +28,65 @@ import org.springframework.stereotype.Service;
 @Service
 public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
 
+    @Resource
+    private ISeckillVoucherService seckillVoucherService;
+
+    @Resource
+    private RedisIdWorker redisIdWorker;
+
+    @Override
+    public Result seckillVoucher(Long voucherId) {
+        SeckillVoucher voucher = seckillVoucherService.getById(voucherId);
+
+        if (voucher.getBeginTime().isAfter(LocalDateTime.now())) {
+            return Result.fail("秒杀尚未开始！");
+        }
+
+        if (voucher.getEndTime().isBefore(LocalDateTime.now())) {
+            return Result.fail("秒杀已经结束！");
+        }
+
+        if (voucher.getStock() <= 0) {
+            return Result.fail("库存不足！");
+        }
+
+        Long userId = UserHolder.getUser().getId();
+        // 保证同一个 userId，拿到同一个 String 锁对象，实现锁的全局唯一性，用来实现「一人一单」的悲观锁控制
+        synchronized (userId.toString().intern()) {
+            // 获取代理对象
+            IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
+            // 调用代理对象的 createVoucherOrder 方法
+            return proxy.createVoucherOrder(voucherId);
+        }
+    }
+
+    @Override
+    @NonNull
+    @Transactional
+    public Result createVoucherOrder(Long voucherId) {
+        // 判断用户是否已经购买过该优惠券
+        Long userId = UserHolder.getUser().getId();
+        int count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
+        if (count > 0) {
+            return Result.fail("用户已经购买过该优惠券！");
+        }
+        // 扣减库存
+        boolean success = seckillVoucherService.update()
+                .setSql("stock = stock - 1")    // 扣减库存
+                .eq("voucher_id", voucherId).gt("stock", 0)    // 确保库存充足
+                .update();
+
+        if (!success) {
+            return Result.fail("库存不足！");
+        }
+
+        VoucherOrder voucherOrder = new VoucherOrder();
+        long orderId = redisIdWorker.nextId("order:");
+        voucherOrder.setId(orderId);
+        voucherOrder.setUserId(userId);
+        voucherOrder.setVoucherId(voucherId);
+        save(voucherOrder);
+
+        return Result.ok(orderId);
+    }
 }
